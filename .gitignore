@@ -1,0 +1,5 @@
+results/
+results.bak*/
+analysis/
+node_modules/
+*.log

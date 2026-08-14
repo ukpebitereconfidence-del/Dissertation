@@ -1,0 +1,8 @@
+{
+  "name": "realtime-bench-servers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Framework-free WebSocket / SSE / HTTP-polling servers for real-time messaging benchmarks",
+  "engines": { "node": ">=22.0.0" },
+  "dependencies": { "ws": "8.18.0" }
+}

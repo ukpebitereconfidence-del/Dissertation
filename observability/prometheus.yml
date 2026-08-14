@@ -1,0 +1,22 @@
+# 1 s scrape interval. Runs are minutes long, so a coarser interval would give
+# too few resource samples per run to characterise variance within it; a finer
+# one would begin to perturb the process being measured.
+global:
+  scrape_interval: 1s
+  scrape_timeout: 900ms
+  evaluation_interval: 15s
+  external_labels:
+    harness: realtime-bench
+
+scrape_configs:
+  # Container-granularity CPU, memory, and network, per Section 2.6.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  # In-process counters from whichever arm is up. Only one is running at a time,
+  # so the failed scrapes of the other three are expected and harmless.
+  - job_name: sut
+    static_configs:
+      - targets: ['ws:8080', 'sse:8080', 'poll-short:8080', 'poll-long:8080']
+    metrics_path: /metrics

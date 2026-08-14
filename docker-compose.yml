@@ -1,0 +1,242 @@
+# Reproducible execution environment (Objective 4, Section 1.5).
+#
+# Design decisions that bear on validity:
+#
+#  * ONE server container is up per run, not four. Running all four
+#    simultaneously would have them compete for the same host CPU and cache, so
+#    each arm's measurement would depend on what the other three were doing.
+#    The orchestrator brings up exactly one arm per cell via profiles.
+#
+#  * CPU is pinned, not merely limited. `cpuset` binds the server to specific
+#    physical cores and the load generator to different ones. Section 1.7
+#    acknowledges CPU contention from the co-located load generator as a
+#    limitation; pinning is how that limitation is controlled rather than just
+#    noted. Override RTB_SUT_CPUS / RTB_GEN_CPUS for the host's topology.
+#
+#  * The server gets ONE core. A single core makes saturation reachable within
+#    the 1,000-client ceiling, which matters because Appelqvist & Ornmyr (2017)
+#    peaked at roughly 4% utilisation and their own validity section identifies
+#    that as their principal limitation. A comparison that never approaches
+#    saturation cannot answer Research Question 3.
+#
+#  * Descriptor limits are raised explicitly and recorded. Kegel (2014) notes an
+#    observed ceiling may reflect a default setting rather than a property of the
+#    architecture, so the limit must be reported alongside the result.
+
+x-server-common: &server-common
+  build:
+    context: ./servers
+    dockerfile: Dockerfile
+  image: realtime-bench/server:1.0.0
+  init: true
+  networks: [bench]
+  cpuset: "${RTB_SUT_CPUS:-0}"
+  cpus: ${RTB_SUT_CPU_LIMIT:-1.0}
+  mem_limit: ${RTB_SUT_MEM:-2g}
+  memswap_limit: ${RTB_SUT_MEM:-2g}
+  ulimits:
+    nofile: { soft: 65535, hard: 65535 }
+  environment: &server-env
+    PORT: "8080"
+    RUN_ID: "${RTB_RUN_ID:-adhoc}"
+    CELL_ID: "${RTB_CELL_ID:-adhoc}"
+    REPLICATE: "${RTB_REPLICATE:-0}"
+    WORKLOAD: "${RTB_WORKLOAD:-notification}"
+    PAYLOAD_BYTES: "${RTB_PAYLOAD_BYTES:-}"
+    SERVER_RATE_HZ: "${RTB_SERVER_RATE_HZ:-}"
+    ROOM_SIZE: "${RTB_ROOM_SIZE:-20}"
+    TCP_NODELAY: "1"
+    COMPRESSION: "0"
+    LOG_LEVEL: "warn"
+  ports: ["8080:8080"]
+
+services:
+  # ---- the four arms, one active per run --------------------------------
+  ws:
+    <<: *server-common
+    profiles: ["ws"]
+    command: ["node", "ws/server.js"]
+    environment:
+      <<: *server-env
+      TRANSPORT: "ws"
+      ARM: "ws"
+
+  sse:
+    <<: *server-common
+    profiles: ["sse"]
+    command: ["node", "sse/server.js"]
+    environment:
+      <<: *server-env
+      TRANSPORT: "sse"
+      ARM: "sse"
+
+  poll-short:
+    <<: *server-common
+    profiles: ["poll-short"]
+    command: ["node", "poll/server.js"]
+    environment:
+      <<: *server-env
+      TRANSPORT: "poll"
+      ARM: "poll-short"
+      POLL_MODE: "short"
+      POLL_INTERVAL_MS: "${RTB_POLL_INTERVAL_MS:-1000}"
+
+  poll-long:
+    <<: *server-common
+    profiles: ["poll-long"]
+    command: ["node", "poll/server.js"]
+    environment:
+      <<: *server-env
+      TRANSPORT: "poll"
+      ARM: "poll-long"
+      POLL_MODE: "long"
+      LONG_POLL_TIMEOUT_MS: "${RTB_LONG_POLL_TIMEOUT_MS:-25000}"
+
+  # ---- load generation --------------------------------------------------
+  k6:
+    build:
+      context: ./loadgen
+      dockerfile: Dockerfile
+    image: realtime-bench/k6-sse:1.0.0
+    profiles: ["load"]
+    networks: [bench]
+    cpuset: "${RTB_GEN_CPUS:-1,2,3}"
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    environment:
+      ARM: "${RTB_ARM:-ws}"
+      TARGET_HOST: "${RTB_ARM:-ws}"
+      TARGET_PORT: "8080"
+      WORKLOAD: "${RTB_WORKLOAD:-notification}"
+      CLIENTS: "${RTB_CLIENTS:-10}"
+      WARMUP_S: "${RTB_WARMUP_S:-30}"
+      DURATION_S: "${RTB_DURATION_S:-300}"
+      POLL_INTERVAL_MS: "${RTB_POLL_INTERVAL_MS:-1000}"
+      CLIENT_RATE_HZ: "${RTB_CLIENT_RATE_HZ:-0}"
+      CLIENT_PAYLOAD_BYTES: "${RTB_CLIENT_PAYLOAD_BYTES:-120}"
+      CELL_ID: "${RTB_CELL_ID:-adhoc}"
+      REPLICATE: "${RTB_REPLICATE:-0}"
+      K6_NO_USAGE_REPORT: "true"
+    volumes:
+      - ./results:/results
+    # NOTE: the raw per-datapoint JSON stream (--out json=) is deliberately NOT
+    # written.
+    #
+    # k6's JSON output records EVERY metric sample individually. A single
+    # 200-second run of the dashboard workload at 100 clients produced a 687 MB
+    # file during the pilot; the 1,000-client cells would have produced several
+    # gigabytes each, and the full 390-run sweep would have needed hundreds of
+    # gigabytes. It filled a 237 GB volume partway through the pilot.
+    #
+    # Nothing in the analysis reads it. analyse.py consumes only the summary
+    # export (run-level aggregates) and the probe output, which together come to
+    # roughly 4 KB per run -- consistent with Section 3.8.1, where the unit of
+    # analysis is the run rather than the message. Retaining per-message records
+    # would be storing three million rows per run in order to compute a handful
+    # of percentiles from them.
+    #
+    # To re-enable for debugging a single cell, add back:
+    #   - --out
+    #   - json=/results/${RTB_CELL_ID:-adhoc}-r${RTB_REPLICATE:-0}-k6.json
+    command:
+      - run
+      - --summary-export
+      - /results/${RTB_CELL_ID:-adhoc}-r${RTB_REPLICATE:-0}-summary.json
+      - /scripts/${RTB_SCRIPT:-ws.js}
+
+  # ---- microsecond-resolution probe ------------------------------------
+  # Runs concurrently with k6. Contributes negligible load but supplies the
+  # fine-grained latency distribution k6's 1 ms clock cannot resolve.
+  probe:
+    <<: *server-common
+    profiles: ["load"]
+    cpuset: "${RTB_PROBE_CPUS:-1,2,3}"
+    ports: []
+    volumes:
+      - ./results:/results
+    command:
+      - node
+      - probe.js
+      - --arm
+      - "${RTB_ARM:-ws}"
+      - --host
+      - "${RTB_ARM:-ws}"
+      - --port
+      - "8080"
+      - --duration
+      - "${RTB_TOTAL_S:-330}"
+      - --warmup
+      - "${RTB_WARMUP_S:-30}"
+      - --clients
+      - "${RTB_PROBE_CLIENTS:-10}"
+      - --workload
+      - "${RTB_WORKLOAD:-notification}"
+      - --pollInterval
+      - "${RTB_POLL_INTERVAL_MS:-1000}"
+      # Chat origination: the probes must generate their own chat traffic so the
+      # messages they measure carry a monotonic stamp. See servers/probe.js.
+      - --clientRate
+      - "${RTB_CLIENT_RATE_HZ:-0}"
+      - --clientPayload
+      - "${RTB_CLIENT_PAYLOAD_BYTES:-120}"
+      - --cell
+      - "${RTB_CELL_ID:-adhoc}"
+      - --replicate
+      - "${RTB_REPLICATE:-0}"
+      - --out
+      - "/results/${RTB_CELL_ID:-adhoc}-r${RTB_REPLICATE:-0}-probe.json"
+
+  # ---- observability ----------------------------------------------------
+  # cAdvisor for container-granularity resource measurement, following the
+  # practice of both recent empirical studies in this area (Appelqvist & Ornmyr,
+  # 2017; Mackovic, 2025), so the resource figures are methodologically
+  # comparable with theirs.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    profiles: ["obs"]
+    networks: [bench]
+    privileged: true
+    command:
+      - "--housekeeping_interval=1s"
+      - "--docker_only=true"
+      - "--store_container_labels=false"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports: ["8081:8080"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["obs"]
+    networks: [bench]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-remote-write-receiver"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["obs"]
+    networks: [bench]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: bench
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+networks:
+  bench:
+    driver: bridge
+
+volumes:
+  prom-data:
